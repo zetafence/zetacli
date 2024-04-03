@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) Zetafence.com 2021-2024
+#
+
+import os, json, re
+import requests, urllib3
+import argparse, configparser
+
+# disable SSL verification warning
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# consts
+CONFIG_FILE = os.environ.get('HOME') + "/.zetafencerc"
+
+# global
+globalConfig = {}
+
+#
+# main parser
+#
+def print_usage(prog):
+    print('Zetafence CLI to interact with management')
+    print(f'Usage: {prog} [-h] [set | get | yucca | k8s | aws] ...')
+    exit(1)
+
+def parseCommands():
+    parser = argparse.ArgumentParser(prog='zetacli',
+                                     description='Zetafence CLI to interact with management.')
+
+    # create subparsers for commands
+    subparsers = parser.add_subparsers(dest='command', help='Top-level commands')
+
+    # subparser for "set" command
+    setCmd = subparsers.add_parser('set', help='Set commands')
+    setCmd.add_argument('--token', type=str, help='Set a token', default='')
+    setCmd.add_argument('--server', type=str, help='Set Zetafence backend server:port', default='')
+    setCmd.add_argument('--app', type=str, help='Set an app', default='')
+    setCmd.add_argument('--behavior', type=str, help='Set a behavioral profile', default='')
+
+    # subparser for "get" command
+    getCmd = subparsers.add_parser('get', help='Get commands')
+    getCmd.add_argument('--app', action='store_true', help='Get the current app', default='')
+    getCmd.add_argument('--server', action='store_true', help='Get Zetafence backend server', default='')
+
+    # Subparser for the "yucca" command
+    yuccaCmd = subparsers.add_parser('yucca', help='Yucca control plane')
+    yuccaCmd.add_argument('list', type=str, help='Yucca agent list commands')
+    yuccaCmd.add_argument('--users', action='store_true', help='List users in yucca', default=None)
+    yuccaCmd.add_argument('--devices', action='store_true', help='List devices in yucca', default=None)
+    yuccaCmd.add_argument('--threats', action='store_true', help='List threats in yucca', default=None)
+    yuccaCmd.add_argument('--incidents', action='store_true', help='List threats and vulnnerabilities across devices and users in yucca', default=None)
+
+    # Subparser for the "k8s" command
+    k8sCmd = subparsers.add_parser('k8s', help='K8s control plane')
+    k8sCmd.add_argument('list', type=str, help='Kubernetes list commands')
+    k8sCmd.add_argument('--pods', action='store_true', help='List pods in Kubernetes', default=None)
+    k8sCmd.add_argument('--deployments', action='store_true', help='List deployments in Kubernetes', default=None)
+    k8sCmd.add_argument('--service-accounts', action='store_true', help='List service accounts in Kubernetes', default=None)
+    k8sCmd.add_argument('--roles', action='store_true', help='List roles in Kubernetes', default=None)
+    k8sCmd.add_argument('--cluster-roles', action='store_true', help='List cluster roles in Kubernetes', default=None)
+    k8sCmd.add_argument('--pods-serviceaccounts', action='store_true', help='List pods associated with one or more service accounts in Kubernetes', default=None)
+    k8sCmd.add_argument('--serviceaccounts-pods', action='store_true', help='List which service accounts are associated with one or more pods in Kubernetes', default=None)
+    k8sCmd.add_argument('--deployments-clusterrole', action='store_true', help='List which deployments have cluster-role access in Kubernetes', default=None)
+    k8sCmd.add_argument('--clusterrole-roles', action='store_true', help='List which cluster-role are bound to which roles in Kubernetes', default=None)
+
+    # aws behavioral commands
+    awsCmd = subparsers.add_parser('aws', help='AWS list security controls')
+    awsCmd.add_argument('security', type=str, help='AWS list info')
+    awsCmd.add_argument('--list', action='store_true', help='AWS list security info', default=None)
+    awsCmd.add_argument('--auth', action='store_true', help='auth and credentials', default=None)
+    awsCmd.add_argument('--iam', action='store_true', help='IAM', default=None)
+    awsCmd.add_argument('--exfiltration', action='store_true', help='Exfiltration', default=None)
+    awsCmd.add_argument('--insiderthreats', action='store_true', help='Insider Threats', default=None)
+    awsCmd.add_argument('--infravuln', action='store_true', help='Infra Vulnerabilities', default=None)
+    awsCmd.add_argument('--privilege', action='store_true', help='Privilege Escalations', default=None)
+    awsCmd.add_argument('--monitoring', action='store_true', help='Monitoring', default=None)
+
+    # Parse the command line arguments
+    args = parser.parse_args()
+
+    # If no arguments provided, print basic usage
+    if not any(vars(args).values()):
+        print_usage(parser.prog)
+        return
+
+    # perform command corresponding action
+    if args.command == 'set':
+        process_command_set(args)
+    elif args.command == 'get':
+        process_command_get(args)
+    elif args.command == 'yucca':
+        process_command_yucca(args)
+    elif args.command == 'k8s':
+        process_command_k8s(args)
+    elif args.command == 'aws':
+        process_command_aws(args)
+    else:
+        print('Invalid command. Use -h or --help for usage information.')
+
+#
+# write all global config into file
+#
+def writeConfigToFile(section, key, value, filename):
+    config = configparser.ConfigParser()
+
+    for key, value in globalConfig.items():
+        #section, option = key.split('_')
+        if section not in config:
+            config.add_section(section)
+        config.set(section, key, value)
+
+    with open(filename, 'w') as configfile:
+        config.write(configfile)
+
+#
+# read config file into global
+#
+def readConfig(filename):
+    # Read values from the configuration file into global_arguments
+    config = configparser.ConfigParser()
+    if not os.path.exists(filename):
+        print(f'error: unable to find file {filename}')
+        return
+    config.read(filename)
+    for section in config.sections():
+        for option, value in config.items(section):
+            globalConfig[option] = value
+
+#
+# callAppQueryApi calls query app API with given JSON object
+#
+def callAppQueryApi(obj):
+    app     = globalConfig["app"]
+    server  = globalConfig["server"]
+    uri     = 'https://' + server + '/v1' + app + "/query"
+    token   = globalConfig["token"]
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+
+    # make a POST request
+    response = requests.post(uri, headers=headers, json=obj, verify=False)
+
+    # check the status code and handle the response
+    if response.status_code == 200:
+        return response.json()
+
+    print(f"Error: {response.status_code} - {response.text}")
+    return {}
+
+#
+# callBehaviorQueryApi calls behavior profile API with given URI e.g. "/auth"
+#
+def callBehaviorQueryApi(reqUri):
+    behavior= globalConfig["behavior"]
+    server  = globalConfig["server"]
+    uri     = 'https://' + server + '/v1' + behavior + "/" + reqUri
+    token   = globalConfig["token"]
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+
+    # make a GET request
+    response = requests.get(uri, headers=headers, verify=False)
+
+    # check the status code and handle the response
+    if response.status_code == 200:
+        return response.json()
+
+    print(f"Error: {response.status_code} - {response.text}")
+    return {}
+
+#
+# is string valid IP:Port format
+#
+def is_valid_ip_port(input):
+    # RE for IP:Port format (including hostname)
+    ip_port_pattern = re.compile(r'^([a-zA-Z0-9.-]+|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})$')
+
+    # input string matches the pattern
+    return bool(ip_port_pattern.match(input))
+
+#
+# set commands
+#
+def process_command_set(args):
+    if args.token != '':
+        globalConfig["token"] = args.token
+        print(f'Set token successfully')
+    if args.app != '':
+        globalConfig["app"] = args.app
+        print(f'Set app successfully')
+    if args.behavior != '':
+        globalConfig["behavior"] = args.behavior
+        print(f'Set behavior profile successfully')
+    if args.server != '':
+        if is_valid_ip_port(args.server):
+            globalConfig["server"] = args.server
+            print(f'Set server successfully')
+        else:
+            print(f'error: expected IP:Port format')
+    writeConfigToFile("globals", "token", args.token, CONFIG_FILE)
+
+#
+# get commands
+#
+def process_command_get(args):
+    if args.app:
+        print('Currently active app:')
+        print(globalConfig["app"])
+    if args.server:
+        print('Currently active server:')
+        print(globalConfig["server"])
+
+#
+# generic query routine that calls API
+#
+def process_command_query(query, field):
+    req = {}
+    req["query"] = query
+    resp = callAppQueryApi(req)
+    if "response" in resp:
+        if field in resp["response"]:
+            name = resp["response"][field]
+            if "values" in name:
+                jd = json.dumps(name["values"], indent=4)
+                jd = "\t" + jd.replace("\n", "\n\t")
+                print(jd)
+                return name["values"]
+    print("no objects found")
+
+#
+# behavioral profile query for specific command type e.g. "auth"
+#
+def process_behavioral_command_query(cmd):
+    resp = callBehaviorQueryApi(cmd)
+    if "stanzas" in resp:
+        jd = json.dumps(resp["stanzas"], indent=4)
+        print(jd)
+        return
+    print("no objects found")
+
+#
+# yucca list commands
+#
+def process_command_yucca_list_users():
+    print('List of users')
+    process_command_query("MATCH (u:yucca_user) RETURN u.Name", "u.Name")
+
+def process_command_yucca_list_devices():
+    print('List of devices')
+    process_command_query("MATCH (d:yucca_device) RETURN d.Id", "d.Id")
+
+def process_command_yucca_list_threats():
+    # TOR nodes
+    print('TOR nodes found')
+    process_command_query("MATCH (t:yucca_tor_node) RETURN t.Name", "t.Name")
+
+    # suspected IPs
+    print('Suspected IPs found')
+    process_command_query("MATCH (d:yucca_suspected_ip) RETURN d.Name", "d.Name")
+
+    # suspected domains
+    print('Suspected domains found')
+    process_command_query("MATCH (d:yucca_suspected_domain) RETURN d.Name", "d.Name")
+
+def process_command_yucca_list_incidents():
+    # device TOR nodes
+    print('Devices affected by TOR nodes')
+    process_command_query("MATCH (u:yucca_device)--(t:yucca_tor_node) RETURN u.Id", "u.Id")
+
+    # user TOR nodes
+    print('Users affected by TOR nodes')
+    process_command_query("MATCH (u:yucca_user)--(t:yucca_tor_node) RETURN u.Name", "u.Name")
+    
+    # devices affected by suspicious domains
+    print('Devices affected by suspicious domains')
+    process_command_query("MATCH (u:yucca_device)--(t:yucca_suspected_domain) RETURN u.Id", "u.Id")
+
+    # devices affected by suspicious IPs
+    print('Devices affected by suspicious IPs')
+    process_command_query("MATCH (u:yucca_device)--(t:yucca_suspected_ip) RETURN u.Id", "u.Id")
+
+    # users affected by suspicious domains
+    print('Users affected by suspicious domains')
+    process_command_query("MATCH (u:yucca_user)--(t:yucca_suspected_domain) RETURN u.Name", "u.Name")
+
+    # users affected by suspicious IPs
+    print('Users affected by suspicious IPs')
+    process_command_query("MATCH (u:yucca_user)--(t:yucca_suspected_ip) RETURN u.Name", "u.Name")
+
+def process_command_yucca(args):
+    if not "token" in globalConfig:
+        print("error: please set 'token' before running other commands")
+        return
+    if not "app" in globalConfig:
+        print("error: please set 'app' before running other commands")
+        return
+    if args.users:
+        process_command_yucca_list_users()
+    if args.devices:
+        process_command_yucca_list_devices()
+    if args.threats:
+        process_command_yucca_list_threats()
+    if args.incidents:
+        process_command_yucca_list_incidents()
+
+#
+# k8s commands
+#
+def process_command_k8s_list_pods():
+    process_command_query("MATCH (p:k8s_pod) RETURN p.Id", "p.Id")
+
+def process_command_k8s_list_deployments():
+    process_command_query("MATCH (d:k8s_deployment) RETURN d.Id", "d.Id")
+
+def process_command_k8s_list_serviceaccounts():
+    process_command_query("MATCH (s:k8s_serviceaccount) RETURN s.Id", "s.Id")
+
+def process_command_k8s_list_roles():
+    process_command_query("MATCH (r:k8s_role) RETURN r.Id", "r.Id")
+
+def process_command_k8s_list_clusterroles():
+    process_command_query("MATCH (r:k8s_clusterrole) RETURN r.Id", "r.Id")
+
+def process_command_k8s_list_pods_serviceaccounts():
+    process_command_query("MATCH (u:k8s_pod)--(t:k8s_serviceaccount) RETURN u.Id,t.Id", "u.Id")
+
+def process_command_k8s_list_serviceaccounts_pods():
+    process_command_query("MATCH (u:k8s_serviceaccount)--(t:k8s_pods) RETURN u.Id,t.Id", "u.Id")
+
+def process_command_k8s_list_deployments_clusterrole():
+    process_command_query("MATCH (u:k8s_clusterrole),(t:k8s_deployment)--(t:k8s_deployment) RETURN u.Id,t.Id", "t.Id")
+
+def process_command_k8s_list_clusterrole_roles():
+    print("Cluster Role: ")
+    process_command_query("MATCH (u:k8s_clusterrole),(t:k8s_role)--(t:k8s_role) RETURN u.Id,t.Id", "u.Id")
+    print("Roles: ")
+    process_command_query("MATCH (u:k8s_clusterrole),(t:k8s_role)--(t:k8s_role) RETURN u.Id,t.Id", "t.Id")
+
+# process_command_k8s to process k8s commands
+def process_command_k8s(args):
+    if not "token" in globalConfig:
+        print("error: please set token before running other commands")
+        return
+    if not "app" in globalConfig:
+        print("error: please set 'app' before running other commands")
+        return
+    if args.pods:
+        process_command_k8s_list_pods()
+    if args.deployments:
+        process_command_k8s_list_deployments()
+    if args.service_accounts:
+        process_command_k8s_list_serviceaccounts()
+    if args.roles:
+        process_command_k8s_list_roles()
+    if args.cluster_roles:
+        process_command_k8s_list_clusterroles()
+    if args.pods_serviceaccounts:
+        process_command_k8s_list_pods_serviceaccounts()
+    if args.serviceaccounts_pods:
+        process_command_k8s_list_serviceaccounts_pods()
+    if args.deployments_clusterrole:
+        process_command_k8s_list_deployments_clusterrole()
+    if args.clusterrole_roles:
+        process_command_k8s_list_clusterrole_roles()
+
+#
+# AWS list security queries from dependencies
+#
+def process_command_aws_list_security():
+    print("AWS policies:")
+    process_command_query("MATCH (u:aws_policy) RETURN u.Id", "u.Id")
+    print("AWS roles:")
+    process_command_query("MATCH (u:aws_role) RETURN u.Id", "u.Id")
+    print("AWS users:")
+    process_command_query("MATCH (u:aws_user) RETURN u.Attributes", "u.Attributes")
+    print("AWS instances:")
+    process_command_query("MATCH (u:aws_instance) RETURN u.Attributes", "u.Attributes")
+
+#
+# AWS behavioral security commands
+#
+def process_command_aws_behavior(cmd):
+    print(f"AWS behavioral command {cmd}: ")
+    process_behavioral_command_query(cmd)
+
+# process_command_aws to process k8s commands
+def process_command_aws(args):
+    if not "token" in globalConfig:
+        print("error: please set token before running other commands")
+        return
+    if not "app" in globalConfig:
+        print("error: please set 'app' before running other commands")
+        return
+    if args.list:
+        process_command_aws_list_security()
+    if args.auth:
+        process_command_aws_behavior("auth")
+    if args.iam:
+        process_command_aws_behavior("iam")
+    if args.exfiltration:
+        process_command_aws_behavior("exfiltration")
+    if args.insiderthreats:
+        process_command_aws_behavior("insiderthreats")
+    if args.infravuln:
+        process_command_aws_behavior("infravuln")
+    if args.privilege:
+        process_command_aws_behavior("privilege")
+    if args.monitoring:
+        process_command_aws_behavior("monitoring")
+
+#
+# main
+#
+if __name__ == '__main__':
+    readConfig(CONFIG_FILE)
+    parseCommands()
