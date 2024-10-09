@@ -24,6 +24,12 @@ chmod +x zetacli
 
 <br />
 
+## Install Python Package Requirements
+
+```
+$ pip install -r requirements.txt
+```
+
 ## General Usage
 
 ```
